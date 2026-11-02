@@ -1,0 +1,97 @@
+# Authored by agentic-sealer: Apache CXF ships no GitHub Actions CI.
+# Mirrors the 3.0.0-milestone1 release toolchain (JDK 1.6, cxf.jdk.version=1.6)
+# and the project's own Maven build (BUILDING.txt: mvn install) of the core module.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 48
+    env:
+      MAVEN_OPTS: "-Xmx2g -XX:MaxPermSize=512m -Dfile.encoding=UTF-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 6
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "6"
+
+      - name: Install Maven 3.2.5
+        run: |
+          # Maven 3.3+ needs Java 7; 3.2.5 is the last line that runs on JDK 6.
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.2.5/binaries/apache-maven-3.2.5-bin.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.2.5/bin" >> "$GITHUB_PATH"
+
+      - name: Maven settings (plain-HTTP Central mirror for JDK 6)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-http</id>
+                <mirrorOf>*</mirrorOf>
+                <url>http://insecure.repo1.maven.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+          java -version
+          mvn -version
+
+      - name: Build and test cxf-core
+        run: |
+          COMMON="-B -e -Djava.awt.headless=true -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dgpg.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dcpd.skip=true"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn clean install -pl core $COMMON -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false
+          else
+            mvn clean install -pl core $COMMON
+          fi
+
+      - name: Systests covering patched paths
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          # The systests resolve cxf-core from the jar installed above.
+          SYS="-B -e -Djava.awt.headless=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dcpd.skip=true -DfailIfNoTests=false"
+          # cxf-testutils from Central carries generated services whose wsdlLocation is a
+          # file: path on the release machine; rebuild it here so those paths resolve.
+          mvn install -pl testutils -B -e -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dcpd.skip=true
+          mvn test -pl systests/jaxrs $SYS -Dtest=JAXRSClientServerSpringBookTest,JAXRSMultipartTest
+          mvn test -pl systests/jaxws $SYS -Dtest=ClientServerTest
+
+      - name: Report surefire results (incl. skipped tests)
+        if: always()
+        run: |
+          for f in core/target/surefire-reports/TEST-*.xml systests/jaxrs/target/surefire-reports/TEST-*.xml systests/jaxws/target/surefire-reports/TEST-*.xml; do
+            [ -f "$f" ] || continue
+            grep -o '<testsuite [^>]*' "$f" | sed -E 's/.*name="([^"]*)".*/\1/' | head -1 | tr '\n' ' '
+            grep -o 'tests="[0-9]*"\|failures="[0-9]*"\|errors="[0-9]*"\|skipped="[0-9]*"' "$f" | head -4 | tr '\n' ' '
+            echo
+            if grep -q '<skipped' "$f"; then
+              grep -B1 '<skipped' "$f" | grep -o 'testcase [^>]*name="[^"]*"'
+              # Surefire 2.15 omits the @Ignore message; print it from the test source.
+              grep -B1 '<skipped' "$f" | grep -o 'name="[^"]*" classname="[^"]*"' | while read -r tc; do
+                m=$(echo "$tc" | sed -E 's/name="([^"]*)".*/\1/')
+                c=$(echo "$tc" | sed -E 's/.*classname="([^"]*)"/\1/')
+                src=$(find . -path "*/src/test/java/$(echo "$c" | tr . /).java" | head -1)
+                echo "SKIPPED $c.$m reason: $(grep -B3 "void $m(" "$src" | grep -o '@Ignore.*')"
+              done
+            fi
+          done
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxf-core
+          path: core/target/cxf-core-*.jar
+          if-no-files-found: error
